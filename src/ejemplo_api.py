@@ -5,25 +5,30 @@ en `ejemplos-api/`, con esos dos datos en el nombre, así que `challenger`
 y otro alias no se pisan.
 
     python src/ejemplo_api.py
-    python src/ejemplo_api.py --modelo credit-risk-modelo-final --alias challenger
-    python src/ejemplo_api.py --modelo credit-risk-agrupado --alias challenger
+    python src/ejemplo_api.py --modelo modelo-mermo-depresion --alias challenger
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 import mlflow
 import mlflow.pyfunc
 import pandas as pd
-from mlflow.models import Model
+from mlflow.models import Model, infer_signature
 from mlflow.tracking import MlflowClient
 
-import config
+RAIZ = Path(__file__).resolve().parents[1]
+if str(RAIZ) not in sys.path:
+    sys.path.insert(0, str(RAIZ))
 
-SALIDA = config.RAIZ / "ejemplos-api"
+from src import config
+from src.data import cargar_y_preparar_datos
+
+SALIDA = RAIZ / "ejemplos-api"
 PUERTO = 5001
 
 
@@ -54,20 +59,20 @@ def _payload(ejemplo) -> dict | None:
     return _jsonable(ejemplo)
 
 
-def _predecir(uri: str, ejemplo) -> dict | None:
-    if not isinstance(ejemplo, pd.DataFrame):
-        return None
-    modelo = mlflow.pyfunc.load_model(uri)
-    prediccion = modelo.predict(ejemplo)
-    if hasattr(prediccion, "tolist"):
-        prediccion = prediccion.tolist()
-    return {"predictions": _jsonable(prediccion)}
+def _cargar_ejemplo(uri: str) -> pd.DataFrame:
+    """Obtiene un ejemplo del modelo o construye uno con el preprocesamiento actual."""
+    ejemplo = Model.load(uri).load_input_example(uri)
+    if isinstance(ejemplo, pd.DataFrame):
+        return ejemplo.head(1)
+
+    X_train, _, _, _, _, nombres_columnas = cargar_y_preparar_datos()
+    return pd.DataFrame(X_train[:1], columns=nombres_columnas)
 
 
 def _esquema(firma, lado: str) -> str:
     tensor = getattr(firma, lado, None) if firma is not None else None
     if tensor is None:
-        return "No hay firma registrada."
+        return "No hay firma disponible."
     return json.dumps(tensor.to_dict(), indent=2, ensure_ascii=False)
 
 
@@ -78,11 +83,13 @@ def generar(modelo: str, alias: str, puerto: int = PUERTO) -> Path:
     cliente = MlflowClient(tracking_uri=config.MLFLOW_TRACKING_URI)
     version = cliente.get_model_version_by_alias(modelo, alias)
     info = mlflow.models.get_model_info(uri)
-    ejemplo = Model.load(uri).load_input_example(uri)
-    if isinstance(ejemplo, pd.DataFrame):
-        ejemplo = ejemplo.head(1)
+    ejemplo = _cargar_ejemplo(uri)
     payload = _payload(ejemplo)
-    respuesta = _predecir(uri, ejemplo) if payload is not None else None
+    modelo_mlflow = mlflow.pyfunc.load_model(uri)
+    prediccion = modelo_mlflow.predict(ejemplo)
+    predicciones = prediccion.tolist() if hasattr(prediccion, "tolist") else prediccion
+    respuesta = {"predictions": _jsonable(predicciones)}
+    firma = info.signature or infer_signature(ejemplo, prediccion)
 
     cuerpo_peticion = (
         json.dumps(payload, indent=2, ensure_ascii=False) if payload is not None else None
@@ -108,39 +115,45 @@ def generar(modelo: str, alias: str, puerto: int = PUERTO) -> Path:
         "## Esquema de entrada",
         "",
         "```json",
-        _esquema(info.signature, "inputs"),
+        _esquema(firma, "inputs"),
         "```",
-        "",
-        "## Esquema de salida",
-        "",
-        "```json",
-        _esquema(info.signature, "outputs"),
-        "```",
-        "",
-        "## Petición",
         "",
     ]
-    if cuerpo_peticion is None:
-        lineas.append(
-            "Este modelo no tiene `input_example`. No hay una fila de prueba para armar la petición."
-        )
-    else:
+    if info.signature is None:
         lineas.extend(
             [
-                "```bash",
-                curl,
-                "```",
+                "La firma se infirió a partir del ejemplo porque esta versión del modelo no la tiene registrada.",
                 "",
-                "```json",
-                cuerpo_peticion,
-                "```",
             ]
         )
+    lineas.extend(
+        [
+            "## Esquema de salida",
+            "",
+            "```json",
+            _esquema(firma, "outputs"),
+            "```",
+            "",
+            "Los valores de entrada deben estar codificados y escalados con el mismo preprocesamiento del entrenamiento.",
+            "La predicción `1` indica que disminuyó la depresión; `0` indica que no disminuyó.",
+            "",
+            "## Petición",
+            "",
+        ]
+    )
+    lineas.extend(
+        [
+            "```bash",
+            curl,
+            "```",
+            "",
+            "```json",
+            cuerpo_peticion,
+            "```",
+        ]
+    )
     lineas.extend(["", "## Respuesta", ""])
-    if cuerpo_respuesta is None:
-        lineas.append("Sin `input_example` no se ejecutó la predicción.")
-    else:
-        lineas.extend(["```json", cuerpo_respuesta, "```"])
+    lineas.extend(["```json", cuerpo_respuesta, "```"])
     lineas.append("")
 
     SALIDA.mkdir(parents=True, exist_ok=True)

@@ -1,111 +1,88 @@
-"""Entrena las cuatro estrategias del notebook y las deja en MLflow.
-
-Cada modelo es un run del experimento `MLFLOW_EXPERIMENT_NAME`:
-regresión logística, SVM, árbol de decisión y random forest. En todos
-se registra accuracy sobre la partición de prueba, los parámetros y el
-clasificador. El artefacto `model` es solo ese estimador: la API espera
-las columnas ya codificadas y escaladas. La columna Dataset del run
-apunta a la partición de entrenamiento y a la de prueba.
-
-Es el entry point `main` de `MLproject` (`mlflow run .`).
-"""
+"""Entrenamiento de clasificadores y registro de experimentos en MLflow."""
 
 from __future__ import annotations
 
 import os
+import sys
+from pathlib import Path
+
+# --- INSERCIÓN OBLIGATORIA PARA RESOLVER EL MÓDULO 'src' ---
+RAIZ = Path(__file__).resolve().parents[1]
+if str(RAIZ) not in sys.path:
+    sys.path.insert(0, str(RAIZ))
+# -----------------------------------------------------------
 
 import mlflow
 import mlflow.sklearn
+import pandas as pd
+from mlflow.models import infer_signature
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score
-from sklearn.svm import SVC
 from sklearn.tree import DecisionTreeClassifier
+from sklearn.svm import SVC
 
-import config
-from data import cargar_particion, registrar_preprocesamiento
-
-
-def _modelos():
-    semilla = config.RANDOM_SEED
-    return [
-        ("regresion_logistica", LogisticRegression(random_state=semilla)),
-        ("svm", SVC(random_state=semilla)),
-        ("arbol_decision", DecisionTreeClassifier(random_state=semilla)),
-        ("random_forest", RandomForestClassifier(random_state=semilla)),
-    ]
+from src.config import RANDOM_SEED, activar_seguimiento
+from src.data import cargar_y_preparar_datos
 
 
-def _datasets(x_train, y_train, x_test, y_test):
-    """Arma los dos conjuntos que muestra la columna Dataset de cada run."""
-    origen = str(config.DATA_PATH)
-
-    def conjunto(features, objetivo, nombre):
-        tabla = features.copy()
-        tabla[config.TARGET] = objetivo
-        return mlflow.data.from_pandas(
-            tabla,
-            source=origen,
-            targets=config.TARGET,
-            name=nombre,
-        )
-
-    return (
-        conjunto(x_train, y_train, "credit_risk_train"),
-        conjunto(x_test, y_test, "credit_risk_test"),
-    )
-
-
-def _parametros(modelo) -> dict:
-    parametros = {}
-    for clave, valor in modelo.get_params().items():
-        if isinstance(valor, (int, float, str, bool)):
-            parametros[clave] = valor
-        else:
-            parametros[clave] = "None" if valor is None else str(valor)
-    return parametros
-
-
-def entrenar():
-    """Ajusta los cuatro modelos y abre un run por cada uno."""
-    # `mlflow run` ya abrió un run padre. Los modelos van en runs propios
-    # del experimento configurado, para que `register.py` pueda compararlos.
+def entrenar_modelos():
+    """Entrena los modelos, calcula el score de train y test, y registra cada run en MLflow."""
     os.environ.pop("MLFLOW_RUN_ID", None)
-    config.activar_seguimiento()
-    mlflow.sklearn.autolog(disable=True)
 
-    x_train, x_test, y_train, y_test, _, material = cargar_particion()
-    with mlflow.start_run(run_name="preprocesamiento"):
-        registrar_preprocesamiento(material)
-    print(
-        f"Partición: train {x_train.shape[0]} filas, "
-        f"test {x_test.shape[0]} filas, {x_train.shape[1]} features"
-    )
+    # 1. Activar el seguimiento en MLflow
+    activar_seguimiento()
 
-    datos_train, datos_test = _datasets(x_train, y_train, x_test, y_test)
-    ejemplo = x_train.head(1)
+    # 2. Cargar y preparar datos
+    X_train, X_test, y_train, y_test, _, nombres_columnas = cargar_y_preparar_datos()
+    X_train = pd.DataFrame(X_train, columns=nombres_columnas)
+    X_test = pd.DataFrame(X_test, columns=nombres_columnas)
 
-    for nombre, modelo in _modelos():
-        with mlflow.start_run(run_name=nombre):
-            mlflow.log_input(datos_train, context="training")
-            mlflow.log_input(datos_test, context="evaluation")
-            modelo.fit(x_train, y_train)
-            prediccion = modelo.predict(x_test)
-            accuracy = accuracy_score(y_test, prediccion)
+    # 3. Diccionario con los 4 algoritmos del notebook original
+    modelos = {
+        "regresion_logistica": LogisticRegression(random_state=RANDOM_SEED),
+        "svc": SVC(random_state=RANDOM_SEED),
+        "arbol_decision": DecisionTreeClassifier(random_state=RANDOM_SEED),
+        "random_forest": RandomForestClassifier(random_state=RANDOM_SEED),
+    }
 
-            mlflow.log_params(_parametros(modelo))
-            mlflow.log_param("estrategia", nombre)
-            mlflow.log_param("test_size", config.TEST_SIZE)
-            mlflow.log_param("random_seed", config.RANDOM_SEED)
-            mlflow.log_metric(config.METRIC, accuracy)
+    print("Iniciando entrenamiento y registro en MLflow...\n")
+
+    # 4. Iterar sobre cada modelo y registrar el Run en MLflow
+    for nombre_modelo, modelo in modelos.items():
+        with mlflow.start_run(run_name=nombre_modelo):
+            # Entrenar modelo
+            modelo.fit(X_train, y_train)
+
+            # Evaluar precisión (Score / Accuracy)
+            score_train = modelo.score(X_train, y_train)
+            score_test = modelo.score(X_test, y_test)
+
+            # Registrar parámetros en MLflow
+            mlflow.log_param("model_type", nombre_modelo)
+            mlflow.log_param("random_seed", RANDOM_SEED)
+
+            # Registrar métricas en MLflow
+            mlflow.log_metric("accuracy_train", score_train)
+            mlflow.log_metric("accuracy", score_test)  # Métrica principal
+
+            input_example = X_train.head(1)
+            signature = infer_signature(input_example, modelo.predict(input_example))
+
+            # Loguear el modelo entrenado como artefacto de MLflow
             mlflow.sklearn.log_model(
                 modelo,
                 name="model",
-                input_example=ejemplo,
-                serialization_format="pickle",
+                signature=signature,
+                input_example=input_example,
+                skops_trusted_types=["sklearn.tree._tree.Tree"],
             )
-            print(f"{nombre}: {config.METRIC}={accuracy:.6f}")
+
+            print(
+                f"[{nombre_modelo}] -> Train Accuracy: {score_train:.4f} | Test Accuracy: {score_test:.4f}"
+            )
+
+    print("\n¡Entrenamiento finalizado con éxito!")
 
 
 if __name__ == "__main__":
-    entrenar()
+    entrenar_modelos()
